@@ -237,6 +237,12 @@ class MarketDataFeed:
     def all_mids(self) -> dict[str, Decimal]:
         return dict(self._all_mids)
 
+    def seconds_since_last_message(self) -> float | None:
+        """Aika sekunteina viimeisestä WS-viestistä. None jos ei vielä yhdistynyt."""
+        if self._last_message_at == 0.0:
+            return None
+        return max(0.0, time.monotonic() - self._last_message_at)
+
     def realized_volatility(self, window_seconds: float = 60.0) -> float | None:
         """Annualisoitu realized vol log-returneista.
 
