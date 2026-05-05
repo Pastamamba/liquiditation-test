@@ -1,0 +1,45 @@
+# Secrets and runtime config
+.env
+config.yaml
+
+# Local databases
+data/*.db
+data/*.db-wal
+data/*.db-shm
+
+# Logs
+logs/*.log
+logs/stdout.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtualenvs
+.venv/
+venv/
+env/
+
+# Tooling caches
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Claude Code local settings
+.claude/
+
+# Bot runtime
+bot.pid

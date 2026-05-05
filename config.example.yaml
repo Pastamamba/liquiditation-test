@@ -1,0 +1,45 @@
+# Hyperliquid MM Bot — example configuration.
+# Copy to config.yaml ja säädä arvot. ÄLÄ commitoi config.yaml-tiedostoa.
+
+hyperliquid:
+  network: testnet                # testnet | mainnet
+  api_wallet_address: "0x..."     # master-walletin osoite (agent edustaa tätä)
+  # Agentin privaattiavain luetaan ympäristömuuttujasta HL_PRIVATE_KEY
+
+trading:
+  symbol: ETH
+  capital_usdc: 500
+  max_position_size: 0.1          # ETH
+  spread_bps: 5                   # 0.05 % mid:stä molempiin suuntiin
+  num_levels: 5
+  level_spacing_bps: 3
+  order_size: 0.02                # ETH per level
+  skew_factor: 0.5                # paljonko skewataan kun inventory täysi
+  quote_refresh_ms: 2000
+  max_order_age_seconds: 30
+  max_spread_bps: 50              # älä quotaa jos vol-adjusted spread ylittää tämän
+
+risk:
+  max_loss_pct: 10                # session
+  daily_max_loss_pct: 20
+  max_vol_pct_1min: 2.0           # halt jos ylitetään
+  inventory_hard_stop_multiplier: 1.2
+  max_api_errors_per_minute: 5
+  funding_rate_threshold_8h: 0.01 # %
+
+telegram:
+  bot_token_env: TELEGRAM_BOT_TOKEN
+  chat_id_env: TELEGRAM_CHAT_ID
+  notification_rate_limit_seconds: 10
+
+storage:
+  db_path: ./data/mm_bot.db
+  log_path: ./logs/mm_bot.log
+  metrics_interval_seconds: 10
+
+operations:
+  reconnect_initial_backoff_ms: 1000
+  reconnect_max_backoff_ms: 60000
+  websocket_heartbeat_seconds: 5
+  inventory_reconcile_seconds: 30
+  dry_run: false                  # true = älä lähetä oikeita ordereita
