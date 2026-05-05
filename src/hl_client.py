@@ -105,6 +105,8 @@ class FillEntry:
     fee: Decimal
     oid: int
     is_maker: bool
+    tid: int = 0
+    closed_pnl: Decimal | None = None
 
 
 @dataclass(frozen=True)
@@ -653,6 +655,7 @@ class HLClient:
         out: list[FillEntry] = []
         for f in raw or []:
             side: OrderSide = "bid" if f.get("side", "B") == "B" else "ask"
+            closed_pnl_raw = f.get("closedPnl")
             out.append(
                 FillEntry(
                     timestamp_ms=int(f["time"]),
@@ -663,6 +666,12 @@ class HLClient:
                     fee=Decimal(str(f.get("fee", "0"))),
                     oid=int(f.get("oid", 0)),
                     is_maker=not bool(f.get("crossed", False)),
+                    tid=int(f.get("tid", 0)),
+                    closed_pnl=(
+                        Decimal(str(closed_pnl_raw))
+                        if closed_pnl_raw is not None
+                        else None
+                    ),
                 )
             )
         return out
