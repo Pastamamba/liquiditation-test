@@ -1,0 +1,53 @@
+# Hyperliquid MM Bot — TESTNET PILOT 001 configuration.
+#
+# Käyttö: kopioi config.yaml:ksi pilotin ajaksi (`copy config.testnet.yaml config.yaml`)
+# tai aja `python -m src.main --config config.testnet.yaml` jos main tukee --config.
+#
+# Pilot 001 tavoite: 1h ajo Hyperliquid testnetillä, ymmärtää bottia
+# käytännössä, kerätä baseline-metriikat. EI optimoitu fillamiseen — ensin
+# pitää nähdä että orderit pysyvät kirjoissa, kill-switchit toimivat ja
+# Telegram-komennot vastaavat. Säätö tehdään STEP 16:ssa.
+
+hyperliquid:
+  network: testnet                # PILOT: testnet
+  api_wallet_address: "0x..."     # TÄYTÄ: master-walletin osoite
+  # HL_PRIVATE_KEY luetaan .env:istä (agent wallet, EI master)
+
+trading:
+  symbol: ETH
+  capital_usdc: 100               # PILOT: pieni cap (agent prompt vaatimus)
+  max_position_size: 0.02         # ETH, ~70$ @ 3500 → reilusti capital:in alle
+  spread_bps: 8                   # 0.08 % — leveämpi kuin default,
+                                  # toi ei ehkä fillaudu paljon mutta on turvallinen aluksi
+  num_levels: 3                   # 3 levelliä per puoli (default 5) → vähemmän cancel-spamia
+  level_spacing_bps: 4
+  order_size: 0.005               # ETH per level → ~17$ @ 3500
+  skew_factor: 0.5
+  quote_refresh_ms: 3000          # 3 s, vähemmän rate-limit-painetta
+  max_order_age_seconds: 30
+  max_spread_bps: 50
+
+risk:
+  max_loss_pct: 10                # PILOT stop: -10% capitalista = -10 USDC
+  daily_max_loss_pct: 20
+  max_vol_pct_1min: 2.0
+  inventory_hard_stop_multiplier: 1.2
+  max_api_errors_per_minute: 5
+  funding_rate_threshold_8h: 0.01
+
+telegram:
+  bot_token_env: TELEGRAM_BOT_TOKEN
+  chat_id_env: TELEGRAM_CHAT_ID
+  notification_rate_limit_seconds: 10
+
+storage:
+  db_path: ./data/mm_bot_testnet_001.db
+  log_path: ./logs/mm_bot_testnet_001.log
+  metrics_interval_seconds: 10
+
+operations:
+  reconnect_initial_backoff_ms: 1000
+  reconnect_max_backoff_ms: 60000
+  websocket_heartbeat_seconds: 5
+  inventory_reconcile_seconds: 30
+  dry_run: false                  # PILOT: oikeat orderit testnetille
