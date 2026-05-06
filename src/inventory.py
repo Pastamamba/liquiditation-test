@@ -106,6 +106,7 @@ def parse_user_fill(d: Any, *, symbol_filter: str | None = None) -> FillEntry | 
 
 ConnectFactory = Callable[[str], Awaitable[Any]]
 _ChangeCallback = Callable[["InventorySnapshot"], Awaitable[None] | None]
+_RawFillCallback = Callable[[FillEntry], Awaitable[None] | None]
 
 
 class InventoryManager:
@@ -121,6 +122,7 @@ class InventoryManager:
         user_address: str | None = None,
         network: Literal["testnet", "mainnet"] = "testnet",
         on_inventory_change: _ChangeCallback | None = None,
+        on_raw_fill: _RawFillCallback | None = None,
         connect_factory: ConnectFactory | None = None,
         reconcile_interval_s: float = DEFAULT_RECONCILE_INTERVAL_S,
         reconcile_tolerance: Decimal = DEFAULT_RECONCILE_TOLERANCE,
@@ -143,6 +145,7 @@ class InventoryManager:
             WS_URL_MAINNET if network == "mainnet" else WS_URL_TESTNET
         )
         self._on_change = on_inventory_change
+        self._on_raw_fill = on_raw_fill
         self._connect_factory = connect_factory
         self._reconcile_interval = reconcile_interval_s
         self._reconcile_tol = reconcile_tolerance
@@ -252,6 +255,7 @@ class InventoryManager:
             self._update_lots_and_pnl(fill)
             self._refresh_cached_position()
             await self._record_fill(fill)
+        await self._invoke_raw_fill_callback(fill)
         await self._invoke_change_callback()
         return True
 
@@ -332,6 +336,16 @@ class InventoryManager:
                 await result
         except Exception:
             _logger.exception("on_inventory_change callback error")
+
+    async def _invoke_raw_fill_callback(self, fill: FillEntry) -> None:
+        if self._on_raw_fill is None:
+            return
+        try:
+            result = self._on_raw_fill(fill)
+            if asyncio.iscoroutine(result):
+                await result
+        except Exception:
+            _logger.exception("on_raw_fill callback error")
 
     # ----- Reconcile -----
 
