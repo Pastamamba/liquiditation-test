@@ -42,4 +42,4 @@ operations:
   reconnect_max_backoff_ms: 60000
   websocket_heartbeat_seconds: 5
   inventory_reconcile_seconds: 30
-  dry_run: false                  # true = älä lähetä oikeita ordereita
+  dry_run: true                   # turvallinen oletus: simuloi orderit, älä lähetä oikeita

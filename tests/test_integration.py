@@ -499,6 +499,121 @@ async def test_mmbot_provider_callbacks_build_status(
     assert orders == []
 
 
+async def test_mmbot_from_config_dry_run_creates_sim_fill(
+    tmp_path: Path,
+) -> None:
+    """from_config dry-run-tilassa rakentaa SimulatedFillEngine:n eikä
+    vaadi HL_PRIVATE_KEY:tä."""
+    config = _make_config(tmp_path / "from_config_dry.db")
+    config.operations.dry_run = True
+
+    bot = await MMBot.from_config(config, private_key="")
+    try:
+        assert bot.sim_fill is not None
+        assert bot.hl_client.dry_run is True
+    finally:
+        await bot.state_store.close()
+
+
+async def test_mmbot_dry_run_quote_to_fill_chain(
+    tmp_path: Path, state_store: StateStore
+) -> None:
+    """Dry-run end-to-end: quote_loop placeaa orderit → sim_fill täyttää →
+    inventory.apply_fill päivittää position:n."""
+    config = _make_config(tmp_path / "e2e_dry.db")
+    config.operations.dry_run = True
+
+    hl = HLClient(config.hyperliquid, private_key="", dry_run=True)
+
+    md = MarketDataFeed(
+        symbol="ETH",
+        network="testnet",
+        connect_factory=_ws_factory(),
+        silence_timeout_s=120.0,
+    )
+    inv = InventoryManager(
+        symbol="ETH",
+        max_position=Decimal("0.1"),
+        hl_client=hl,
+        state_store=state_store,
+        connect_factory=_ws_factory(),
+        silence_timeout_s=120.0,
+    )
+    qe = QuoteEngine(config.trading, sz_decimals=4)
+    om = OrderManager(
+        hl_client=hl,
+        state_store=state_store,
+        symbol="ETH",
+        cleanup_interval_s=60.0,
+    )
+    rm = RiskManager(
+        config=config.risk,
+        inventory=inv,
+        market_data=md,
+        order_manager=om,
+        hl_client=hl,
+        state_store=state_store,
+        symbol="ETH",
+        session_start_capital=config.trading.capital_usdc,
+        check_interval_s=60.0,
+    )
+    metrics = MetricsCollector(
+        state_store=state_store,
+        inventory=inv,
+        market_data=md,
+        order_manager=om,
+        symbol="ETH",
+        capital_usdc=config.trading.capital_usdc,
+        interval_s=60.0,
+    )
+
+    from src.sim_fill import SimulatedFillEngine
+
+    sim_fill = SimulatedFillEngine(
+        hl_client=hl,
+        market_data=md,
+        symbol="ETH",
+        on_fill=inv.apply_fill,
+        fill_probability=1.0,
+        check_interval_s=0.05,
+    )
+
+    bot = MMBot(
+        config=config,
+        state_store=state_store,
+        hl_client=hl,
+        market_data=md,
+        inventory=inv,
+        quote_engine=qe,
+        order_manager=om,
+        risk_manager=rm,
+        metrics=metrics,
+        notifier=None,
+        sim_fill=sim_fill,
+        quote_loop_interval_s=0.05,
+    )
+    await bot.setup()
+    md._current_book = _make_book(1800.0)
+
+    await bot.start_components()
+    # Anna quote_loop:in placeata orderit
+    await asyncio.sleep(0.2)
+
+    # Mid liikkuu alas → aiemmat passiivit bidit ovat nyt aggressiivisia
+    # → sim_fill täyttää bidit
+    md._current_book = _make_book(1700.0)
+    await asyncio.sleep(0.3)
+
+    bot.request_shutdown()
+    await bot.shutdown()
+
+    # quote_loop placeasi ordereita ja sim_fill näki niitä
+    assert hl.dry_state is not None
+    assert sim_fill.fill_count >= 1
+    # Inventory päivittyi sim_fill → inventory.apply_fill -ketjun kautta
+    assert inv.current_position > Decimal("0")
+
+
 async def test_mmbot_inventory_fill_forwarded_to_order_manager(
     tmp_path: Path, state_store: StateStore, asset_meta: AssetMeta
 ) -> None:

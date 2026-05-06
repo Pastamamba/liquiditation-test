@@ -52,6 +52,7 @@ from src.notifier import (
 from src.order_manager import OrderInfo, OrderManager
 from src.quote_engine import QuoteEngine
 from src.risk import RiskManager, RiskStatus
+from src.sim_fill import SimulatedFillEngine
 from src.state import EventRecord, StateStore
 
 _logger = logging.getLogger(__name__)
@@ -101,6 +102,7 @@ class MMBot:
         risk_manager: RiskManager,
         metrics: MetricsCollector,
         notifier: TelegramNotifier | None = None,
+        sim_fill: SimulatedFillEngine | None = None,
         quote_loop_interval_s: float | None = None,
     ) -> None:
         self.config = config
@@ -113,6 +115,7 @@ class MMBot:
         self.risk_manager = risk_manager
         self.metrics = metrics
         self.notifier = notifier
+        self.sim_fill = sim_fill
 
         if quote_loop_interval_s is None:
             quote_loop_interval_s = max(
@@ -133,17 +136,25 @@ class MMBot:
     async def from_config(
         cls, config: BotConfig, *, private_key: str | None = None
     ) -> MMBot:
-        """Rakenna oletus-bot BotConfigista. Lukee HL_PRIVATE_KEY env:istä."""
+        """Rakenna oletus-bot BotConfigista. Lukee HL_PRIVATE_KEY env:istä.
+
+        Dry-run: jos `config.operations.dry_run == True`, HL_PRIVATE_KEY ei
+        ole pakollinen — käytetään offline-stub:ja oikeiden API-kutsujen
+        sijaan, ja luodaan SimulatedFillEngine täyttämään orderit
+        todennäköisin perustein.
+        """
+        dry_run = config.operations.dry_run
         key = private_key or os.environ.get("HL_PRIVATE_KEY", "")
-        if not key:
+        if not key and not dry_run:
             raise RuntimeError(
-                "HL_PRIVATE_KEY env var is required (set it in .env)"
+                "HL_PRIVATE_KEY env var is required (set it in .env). "
+                "Aja botti dry-run-tilassa jos sinulla ei ole avainta."
             )
         state_store = StateStore(config.storage.db_path)
         await state_store.open()
         await state_store.migrate()
 
-        hl_client = HLClient(config.hyperliquid, key)
+        hl_client = HLClient(config.hyperliquid, key, dry_run=dry_run)
         market_data = MarketDataFeed(
             config.trading.symbol,
             network=config.hyperliquid.network,
@@ -182,6 +193,16 @@ class MMBot:
             interval_s=config.storage.metrics_interval_seconds,
         )
         notifier = _build_notifier(config)
+        sim_fill = (
+            SimulatedFillEngine(
+                hl_client=hl_client,
+                market_data=market_data,
+                symbol=config.trading.symbol,
+                on_fill=inventory.apply_fill,
+            )
+            if dry_run
+            else None
+        )
 
         return cls(
             config=config,
@@ -194,6 +215,7 @@ class MMBot:
             risk_manager=risk_manager,
             metrics=metrics,
             notifier=notifier,
+            sim_fill=sim_fill,
         )
 
     # ----- Setup / wiring -----
@@ -257,6 +279,8 @@ class MMBot:
         await self.order_manager.start()
         await self.risk_manager.start()
         await self.metrics.start()
+        if self.sim_fill is not None:
+            await self.sim_fill.start()
         if self.notifier is not None:
             try:
                 await self.notifier.start()
@@ -309,13 +333,16 @@ class MMBot:
         self._tasks.clear()
 
         # 3) Sulje komponentit
-        for name, stop_fn in (
+        stop_fns: list[tuple[str, Any]] = [
             ("metrics", self.metrics.stop),
             ("risk", self.risk_manager.stop),
             ("order_manager", self.order_manager.stop),
             ("inventory", self.inventory.stop),
             ("market_data", self.market_data.stop),
-        ):
+        ]
+        if self.sim_fill is not None:
+            stop_fns.insert(0, ("sim_fill", self.sim_fill.stop))
+        for name, stop_fn in stop_fns:
             try:
                 await stop_fn()
             except Exception:

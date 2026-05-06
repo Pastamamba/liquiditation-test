@@ -9,6 +9,12 @@ Virhepolitiikka:
   - Rate limit (HTTP 429 / "rate limit"-substring) → retry, kunnioita Retry-After:ia
   - Validation (insufficient, invalid, post only crossed, ...) → raise heti
   - Auth (signature, unauthorized, agent does not exist) → log critical, raise heti
+
+Dry-run:
+  Kun `dry_run=True`, oikeita SDK-kutsuja ei tehdä. Sisäinen `_DryRunState`
+  pitää muistissa simuloitujen ordereiden, fillien ja position-tilan
+  (FIFO weighted avg). `SimulatedFillEngine` (src/sim_fill.py) kuuntelee
+  market_data:a ja kutsuu `simulate_fill()`:iä todennäköisin perustein.
 """
 
 from __future__ import annotations
@@ -18,9 +24,9 @@ import logging
 import re
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import ROUND_DOWN, ROUND_HALF_EVEN, ROUND_UP, Decimal
-from typing import Any, Literal, Protocol
+from typing import Any, ClassVar, Literal, Protocol
 
 OrderSide = Literal["bid", "ask"]
 OrderStatus = Literal["resting", "filled", "rejected"]
@@ -331,6 +337,118 @@ def _make_cloid(s: str | None) -> Any:
     return Cloid.from_str(s)
 
 
+# ---------- Dry-run state ----------
+
+
+@dataclass
+class _DryRunState:
+    """Simuloitu order book + position dry-run tilassa.
+
+    Pidetään asyncio.Lockin alla — hl_client lukee/kirjoittaa metodien
+    sisältä, sim_fill_engine muutta `simulate_fill()`-kutsuilla.
+    """
+
+    open_orders: dict[int, OpenOrder] = field(default_factory=dict)
+    fills: list[FillEntry] = field(default_factory=list)
+    position_size: Decimal = Decimal("0")  # signed: + long, - short
+    avg_entry: Decimal = Decimal("0")
+    next_oid: int = 1_000_000
+    next_tid: int = 1
+
+    def alloc_oid(self) -> int:
+        oid = self.next_oid
+        self.next_oid += 1
+        return oid
+
+    def alloc_tid(self) -> int:
+        tid = self.next_tid
+        self.next_tid += 1
+        return tid
+
+    def add_order(self, order: OpenOrder) -> None:
+        self.open_orders[order.oid] = order
+
+    def remove_order(self, oid: int) -> OpenOrder | None:
+        return self.open_orders.pop(oid, None)
+
+    def apply_fill_to_position(self, side: OrderSide, price: Decimal, size: Decimal) -> None:
+        """Päivitä simuloitua positionia FIFO weighted avg -strategialla."""
+        signed = size if side == "bid" else -size
+        new_pos = self.position_size + signed
+        # Saman suunnan lisäys → weighted avg
+        if (self.position_size >= 0 and signed > 0) or (
+            self.position_size <= 0 and signed < 0
+        ):
+            total_abs = abs(self.position_size) + size
+            if total_abs > 0:
+                self.avg_entry = (
+                    abs(self.position_size) * self.avg_entry + size * price
+                ) / total_abs
+            else:
+                self.avg_entry = Decimal("0")
+        elif new_pos == 0 or (
+            (self.position_size > 0 and new_pos < 0)
+            or (self.position_size < 0 and new_pos > 0)
+        ):
+            # Position kääntyy tai sulkeutuu → uusi avg = täytön hinta
+            self.avg_entry = price if new_pos != 0 else Decimal("0")
+        # Muuten partial close → avg pysyy
+        self.position_size = new_pos
+
+
+# ---------- Dry-run stub Info / Exchange ----------
+
+
+class _DryStubInfo:
+    """Offline stub Info — palauttaa minimaalisen meta-universumin."""
+
+    _UNIVERSE: ClassVar[list[dict[str, Any]]] = [
+        {"name": "ETH", "szDecimals": 4, "maxLeverage": 50, "isDelisted": False},
+        {"name": "BTC", "szDecimals": 5, "maxLeverage": 50, "isDelisted": False},
+        {"name": "SOL", "szDecimals": 2, "maxLeverage": 20, "isDelisted": False},
+    ]
+
+    def meta(self) -> dict[str, Any]:
+        return {"universe": list(self._UNIVERSE)}
+
+    def open_orders(self, _address: str) -> list[Any]:
+        return []
+
+    def user_state(self, _address: str) -> dict[str, Any]:
+        return {"assetPositions": []}
+
+    def user_fills_by_time(
+        self, _address: str, _start_time: int
+    ) -> list[Any]:
+        return []
+
+    def meta_and_asset_ctxs(self) -> list[Any]:
+        return [
+            {"universe": list(self._UNIVERSE)},
+            [{"funding": "0"} for _ in self._UNIVERSE],
+        ]
+
+
+class _DryStubExchange:
+    """Offline stub Exchange — kaikki kutsut raisaavat (eivät pitäisi tulla)."""
+
+    def order(self, *_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError("dry-run: Exchange.order should not be called directly")
+
+    def cancel(self, *_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError("dry-run: Exchange.cancel should not be called directly")
+
+    def bulk_cancel(self, *_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError(
+            "dry-run: Exchange.bulk_cancel should not be called directly"
+        )
+
+    def modify_order(self, *_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError(
+            "dry-run: Exchange.modify_order should not be called directly"
+        )
+
+
 # ---------- HLClient ----------
 
 
@@ -356,15 +474,25 @@ class HLClient:
         retry_delays_s: tuple[float, ...] = DEFAULT_RETRY_DELAYS_S,
         info: _InfoProto | None = None,
         exchange: _ExchangeProto | None = None,
+        dry_run: bool = False,
     ) -> None:
-        if (info is None or exchange is None) and not private_key:
+        # Dry-runissa ei tarvita oikeita SDK-objekteja eikä private_key:tä.
+        # Info/Exchange voidaan silti injektoida testeissä, mutta jos eivät
+        # ole saatavilla, käytetään stub-objekteja jotka eivät tee verkkokutsuja.
+        if not dry_run and (info is None or exchange is None) and not private_key:
             raise HLAuthError("private_key is required when info/exchange not injected")
         self._config = config
+        self._dry_run = dry_run
+        self._dry: _DryRunState | None = _DryRunState() if dry_run else None
+        self._dry_lock = asyncio.Lock() if dry_run else None
         self._info: _InfoProto
         self._exchange: _ExchangeProto
         if info is not None and exchange is not None:
             self._info = info
             self._exchange = exchange
+        elif dry_run:
+            self._info = _DryStubInfo()
+            self._exchange = _DryStubExchange()
         else:
             self._info, self._exchange = self._build_sdk(config, private_key)
         self._bucket = TokenBucket(requests_per_second)
@@ -373,6 +501,15 @@ class HLClient:
         self._meta_fetched_at: float = 0.0
         self._meta_lock = asyncio.Lock()
         self._retry_delays_s = retry_delays_s
+
+    @property
+    def dry_run(self) -> bool:
+        return self._dry_run
+
+    @property
+    def dry_state(self) -> _DryRunState | None:
+        """Dry-run state — None production:issa. Käyttävät vain sim_fill_engine + testit."""
+        return self._dry
 
     @staticmethod
     def _build_sdk(
@@ -499,6 +636,14 @@ class HLClient:
         if rounded_size <= 0:
             raise HLOrderRejectedError(f"size rounds to zero: {size}")
 
+        if self._dry_run:
+            return await self._dry_place_order(
+                symbol, side, rounded_price, rounded_size,
+                client_order_id=client_order_id,
+                reduce_only=reduce_only,
+                post_only=post_only,
+            )
+
         tif = "Alo" if post_only else "Gtc"
         order_type = {"limit": {"tif": tif}}
         is_buy = side == "bid"
@@ -525,6 +670,8 @@ class HLClient:
     async def cancel_order(self, symbol: str, oid: int) -> bool:
         await self.get_asset_meta(symbol)  # validoi symbol
         _logger.debug("cancel_order: symbol=%s oid=%s", symbol, oid)
+        if self._dry_run:
+            return await self._dry_cancel_order(oid)
         try:
             response = await self._call_with_retry(
                 lambda: self._exchange.cancel(symbol, oid),
@@ -538,6 +685,8 @@ class HLClient:
         return bool(statuses) and statuses[0] == "success"
 
     async def cancel_all_orders(self, symbol: str) -> int:
+        if self._dry_run:
+            return await self._dry_cancel_all(symbol)
         opens = await self.get_open_orders(symbol)
         if not opens:
             return 0
@@ -591,6 +740,8 @@ class HLClient:
         return _parse_order_response(response, cloid=None)
 
     async def get_open_orders(self, symbol: str | None = None) -> list[OpenOrder]:
+        if self._dry_run:
+            return await self._dry_get_open_orders(symbol)
         addr = self._config.api_wallet_address
         raw = await self._call_with_retry(
             lambda: self._info.open_orders(addr),
@@ -616,6 +767,8 @@ class HLClient:
         return out
 
     async def get_position(self, symbol: str) -> Position:
+        if self._dry_run:
+            return self._dry_get_position(symbol)
         addr = self._config.api_wallet_address
         state = await self._call_with_retry(
             lambda: self._info.user_state(addr),
@@ -647,6 +800,8 @@ class HLClient:
         )
 
     async def get_user_fills(self, start_time_ms: int) -> list[FillEntry]:
+        if self._dry_run:
+            return self._dry_get_user_fills(start_time_ms)
         addr = self._config.api_wallet_address
         raw = await self._call_with_retry(
             lambda: self._info.user_fills_by_time(addr, start_time_ms),
@@ -689,6 +844,146 @@ class HLClient:
             raise HLClientError(f"asset_id {meta.asset_id} out of range")
         funding = asset_ctxs[meta.asset_id].get("funding", "0")
         return Decimal(str(funding))
+
+    # ----- Dry-run helpers -----
+
+    async def _dry_place_order(
+        self,
+        symbol: str,
+        side: OrderSide,
+        price: Decimal,
+        size: Decimal,
+        *,
+        client_order_id: str | None,
+        reduce_only: bool,
+        post_only: bool,
+    ) -> OrderResult:
+        del reduce_only, post_only  # ei vaikutusta dry-runissa
+        assert self._dry is not None
+        assert self._dry_lock is not None
+        async with self._dry_lock:
+            oid = self._dry.alloc_oid()
+            order = OpenOrder(
+                oid=oid,
+                cloid=client_order_id,
+                symbol=symbol,
+                side=side,
+                price=price,
+                size=size,
+                timestamp_ms=int(time.time() * 1000),
+            )
+            self._dry.add_order(order)
+        _logger.debug(
+            "dry place_order: symbol=%s side=%s price=%s size=%s oid=%s",
+            symbol, side, price, size, oid,
+        )
+        return OrderResult(
+            status="resting",
+            oid=oid,
+            cloid=client_order_id,
+            avg_price=None,
+            filled_size=None,
+        )
+
+    async def _dry_cancel_order(self, oid: int) -> bool:
+        assert self._dry is not None
+        assert self._dry_lock is not None
+        async with self._dry_lock:
+            removed = self._dry.remove_order(oid)
+        _logger.debug("dry cancel_order: oid=%s removed=%s", oid, removed is not None)
+        return removed is not None
+
+    async def _dry_cancel_all(self, symbol: str) -> int:
+        assert self._dry is not None
+        assert self._dry_lock is not None
+        async with self._dry_lock:
+            target_oids = [
+                o.oid for o in self._dry.open_orders.values() if o.symbol == symbol
+            ]
+            for oid in target_oids:
+                self._dry.remove_order(oid)
+        _logger.debug(
+            "dry cancel_all: symbol=%s count=%d", symbol, len(target_oids)
+        )
+        return len(target_oids)
+
+    async def _dry_get_open_orders(
+        self, symbol: str | None
+    ) -> list[OpenOrder]:
+        assert self._dry is not None
+        assert self._dry_lock is not None
+        async with self._dry_lock:
+            return [
+                o
+                for o in self._dry.open_orders.values()
+                if symbol is None or o.symbol == symbol
+            ]
+
+    def _dry_get_position(self, symbol: str) -> Position:
+        assert self._dry is not None
+        return Position(
+            symbol=symbol,
+            size=self._dry.position_size,
+            entry_price=self._dry.avg_entry,
+            unrealized_pnl=Decimal("0"),
+        )
+
+    def _dry_get_user_fills(self, start_time_ms: int) -> list[FillEntry]:
+        assert self._dry is not None
+        return [f for f in self._dry.fills if f.timestamp_ms >= start_time_ms]
+
+    async def simulate_fill(
+        self,
+        oid: int,
+        *,
+        fill_price: Decimal | None = None,
+        fill_size: Decimal | None = None,
+        fee_bps: float = 1.0,
+    ) -> FillEntry | None:
+        """Simuloi fillin yhdelle dry-run-orderille (sim_fill_engine kutsuu).
+
+        Args:
+            oid: cancel:n target — täytyy olla `_DryRunState.open_orders`:issa.
+            fill_price: fillin hinta (None → orderin oma hinta).
+            fill_size: fillin koko (None → orderin koko = full fill).
+            fee_bps: fee:n bps:nä `notional`:sta. 1 bps = 0.01%.
+
+        Palauttaa generoidun FillEntry:n tai None jos orderia ei löytynyt.
+        """
+        if not self._dry_run:
+            raise RuntimeError("simulate_fill requires dry_run=True")
+        assert self._dry is not None
+        assert self._dry_lock is not None
+        async with self._dry_lock:
+            order = self._dry.remove_order(oid)
+            if order is None:
+                return None
+            price = fill_price if fill_price is not None else order.price
+            size = fill_size if fill_size is not None else order.size
+            if size <= 0 or price <= 0:
+                return None
+            notional = price * size
+            fee = (notional * Decimal(str(fee_bps))) / Decimal("10000")
+            tid = self._dry.alloc_tid()
+            fill = FillEntry(
+                timestamp_ms=int(time.time() * 1000),
+                symbol=order.symbol,
+                side=order.side,
+                price=price,
+                size=size,
+                fee=fee,
+                oid=oid,
+                is_maker=True,
+                tid=tid,
+                closed_pnl=None,
+            )
+            self._dry.fills.append(fill)
+            self._dry.apply_fill_to_position(order.side, price, size)
+        _logger.debug(
+            "dry simulate_fill: oid=%s side=%s price=%s size=%s fee=%s",
+            oid, order.side, price, size, fee,
+        )
+        return fill
 
 
 # ---------- Response parsing ----------
